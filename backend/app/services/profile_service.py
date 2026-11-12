@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.constants.column_type import ColumnType
 from app.constants.error_codes import AppError, ErrorCode
-from app.constants.rule_run_status import RuleRunStatus
+from app.constants.rule_run_status import ACTIVE_STATUSES, RuleRunStatus
 from app.models import ColumnProfile, Dataset, RuleRun, User
 from app.profiling import pattern, stats, type_infer
 from app.profiling.loader import load_frame
@@ -18,8 +18,14 @@ from app.utils.logger import log_event
 def start_profile(db: Session, actor: User, dataset: Dataset) -> RuleRun:
     from app.middlewares.quota import consume_scan
 
-    consume_scan(db, actor, dataset.id, "profile")
-    run = RuleRun(dataset_id=dataset.id, kind="profile", triggered_by=actor.id, status=RuleRunStatus.QUEUED.value)
+    lock_token = consume_scan(db, actor, dataset.id, "profile")
+    run = RuleRun(
+        dataset_id=dataset.id,
+        kind="profile",
+        triggered_by=actor.id,
+        status=RuleRunStatus.QUEUED.value,
+        lock_token=lock_token,
+    )
     db.add(run)
     dataset.status = "profiling"
     db.commit()
@@ -48,9 +54,23 @@ def get_profiles(db: Session, dataset_id: int) -> list[ColumnProfile]:
 
 def compute_profiles(db: Session, dataset: Dataset, run: RuleRun) -> int:
     started = time.perf_counter()
-    run.status = RuleRunStatus.RUNNING.value
-    run.started_at = datetime.now()
+    # claim the batch (queued/failed -> running); a cancel that landed first wins
+    claimed = (
+        db.query(RuleRun)
+        .filter(
+            RuleRun.id == run.id,
+            RuleRun.status.in_([RuleRunStatus.QUEUED.value, RuleRunStatus.FAILED.value]),
+        )
+        .update(
+            {RuleRun.status: RuleRunStatus.RUNNING.value, RuleRun.started_at: datetime.now()},
+            synchronize_session=False,
+        )
+    )
     db.commit()
+    if not claimed:
+        db.refresh(run)
+        log_event("RUN_CANCEL_OBSERVED", run_id=run.id, finished_rules=0, total=0)
+        return 0
 
     loaded = load_frame(dataset.file_path, dataset.source_format)
     df = loaded.df
@@ -93,19 +113,35 @@ def compute_profiles(db: Session, dataset: Dataset, run: RuleRun) -> int:
     dataset.row_count = total_rows
     dataset.column_count = len(loaded.columns)
     dataset.status = "profiled"
-    run.rules_total = created
-    run.rules_passed = created
-    run.rows_scanned = total_rows
-    run.duration_ms = int((time.perf_counter() - started) * 1000)
-    run.status = RuleRunStatus.SUCCEEDED.value
-    run.finished_at = datetime.now()
+    duration_ms = int((time.perf_counter() - started) * 1000)
     db.commit()
+    # guarded terminal write: a cancelled profile run stays cancelled
+    finished = (
+        db.query(RuleRun)
+        .filter(RuleRun.id == run.id, RuleRun.status.in_(sorted(ACTIVE_STATUSES)))
+        .update(
+            {
+                RuleRun.rules_total: created,
+                RuleRun.rules_passed: created,
+                RuleRun.rows_scanned: total_rows,
+                RuleRun.duration_ms: duration_ms,
+                RuleRun.status: RuleRunStatus.SUCCEEDED.value,
+                RuleRun.finished_at: datetime.now(),
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    if not finished:
+        db.refresh(run)
+        log_event("RUN_STALE_FINISH", run_id=run.id, status=run.status)
+        return created
     log_event(
         "PROFILE_FINISHED",
         dataset_id=dataset.id,
         run_id=run.id,
         columns=created,
-        duration_ms=run.duration_ms,
+        duration_ms=duration_ms,
     )
     return created
 

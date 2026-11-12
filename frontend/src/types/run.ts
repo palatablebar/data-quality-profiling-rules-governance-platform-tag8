@@ -5,6 +5,7 @@ export interface RunItem {
   rule_type: string
   column_name: string
   severity: string
+  status: string
   passed: boolean
   violation_count: number
   persisted_count: number
@@ -24,6 +25,7 @@ export interface RuleRun {
   rules_total: number
   rules_passed: number
   rules_failed: number
+  rules_unfinished: number
   rows_scanned: number
   rows_scanned_display: string
   duration_ms: number

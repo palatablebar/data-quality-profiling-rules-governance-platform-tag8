@@ -16,6 +16,9 @@ class RuleRunItem(Base):
     rule_type: Mapped[str] = mapped_column(String(24), nullable=False, default="")
     column_name: Mapped[str] = mapped_column(String(190), nullable=False, default="")
     severity: Mapped[str] = mapped_column(String(16), nullable=False, default="medium")
+    # status: RuleRunItemStatus (finished|cancelled); cancelled = the batch was
+    # aborted before this rule ran, row kept so the ledger shows what was skipped
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="finished")
     passed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     violation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     persisted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

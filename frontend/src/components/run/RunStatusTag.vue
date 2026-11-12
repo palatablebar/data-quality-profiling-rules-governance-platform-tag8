@@ -10,6 +10,7 @@ const props = defineProps<{ status: string }>()
 const color = computed(() => {
   if (props.status === 'succeeded') return 'var(--assay)'
   if (props.status === 'failed') return 'var(--alert-deep)'
+  if (props.status === 'cancelled') return 'var(--alert)'
   if (props.status === 'running') return 'var(--ink)'
   return 'var(--ink-soft)'
 })

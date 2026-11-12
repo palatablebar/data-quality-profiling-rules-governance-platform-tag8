@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { fetchRunDetail, fetchRuns } from '../api/run'
+import { cancelRun, fetchRunDetail, fetchRuns } from '../api/run'
 import type { QuotaSnapshot } from '../types/user'
 import type { RuleRun, RunDetail } from '../types/run'
 
@@ -55,6 +55,16 @@ export const useRunStore = defineStore('run', {
         return detail
       } catch (error) {
         this.error = (error as { message?: string }).message ?? '批次详情加载失败'
+        return null
+      }
+    },
+    async cancel(runId: number) {
+      this.error = ''
+      try {
+        await cancelRun(runId)
+        return await this.refreshDetail(runId)
+      } catch (error) {
+        this.error = (error as { message?: string }).message ?? '批次中止失败'
         return null
       }
     },

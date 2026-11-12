@@ -32,6 +32,9 @@ LOG_TEMPLATES = {
     "RUN_FINISHED": "run finished run_id={run_id} status={status} passed={rules_passed} failed={rules_failed} duration_ms={duration_ms}",
     "RUN_FAILED": "run failed run_id={run_id} error_code={error_code} reason={reason}",
     "RUN_CANCELLED": "run cancelled run_id={run_id} by={actor_id}",
+    "RUN_CANCEL_OBSERVED": "run cancellation observed by worker run_id={run_id} finished_rules={finished_rules} total={total}",
+    "RUN_CANCEL_SHELVED": "cancelled run results shelved for diagnostics run_id={run_id} issues={issues} unfinished_rules={unfinished}",
+    "RUN_STALE_FINISH": "stale finish signal dropped run_id={run_id} current_status={status}",
     # --- issues ---
     "AUDIT_ISSUE_GENERATED": "issues generated run_id={run_id} rule_id={rule_id} violations={violations} persisted={persisted}",
     "AUDIT_ISSUE_ASSIGN": "issue assigned issue_id={issue_id} assignee_id={assignee_id} status={status}",

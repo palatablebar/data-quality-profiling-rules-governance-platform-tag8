@@ -7,7 +7,7 @@
     >
       <span
         class="w-[12px] h-[12px] border shrink-0"
-        :class="{ 'tick-enter': item.passed || item.error_code }"
+        :class="{ 'tick-enter': item.status !== 'cancelled' && (item.passed || item.error_code) }"
         :style="boxStyle(item, index)"
       ></span>
       <span class="text-[12.5px] w-[190px] truncate" :class="item.passed ? '' : 'text-ink'" :style="item.passed ? { opacity: 0.72 } : {}">
@@ -16,13 +16,22 @@
       <span class="text-[10.5px] text-ink-soft w-[86px] shrink-0">{{ item.column_name }}</span>
       <SeverityBadge :severity="item.severity" class="w-[52px] shrink-0" />
       <span class="text-[11px] tabular-nums w-[86px] text-right shrink-0">
-        <template v-if="item.error_code">
+        <template v-if="item.status === 'cancelled'">
+          <span :style="{ color: 'var(--alert)' }">未跑完</span>
+        </template>
+        <template v-else-if="item.error_code">
           <span :style="{ color: 'var(--alert-deep)' }">{{ item.error_code }}</span>
         </template>
         <template v-else>{{ item.violation_count }} 违规</template>
       </span>
-      <span class="text-[10.5px] text-ink-soft tabular-nums w-[62px] text-right shrink-0">{{ item.duration_display }}</span>
-      <button v-if="!item.passed && !item.error_code" class="link-button text-[11px] ml-auto shrink-0" @click="$emit('drill', item)">
+      <span class="text-[10.5px] text-ink-soft tabular-nums w-[62px] text-right shrink-0">
+        {{ item.status === 'cancelled' ? '—' : item.duration_display }}
+      </span>
+      <button
+        v-if="item.status !== 'cancelled' && !item.passed && !item.error_code"
+        class="link-button text-[11px] ml-auto shrink-0"
+        @click="$emit('drill', item)"
+      >
         查看违规 →
       </button>
       <span v-else class="ml-auto"></span>
@@ -39,6 +48,14 @@ defineProps<{ items: RunItem[]; runStatus?: string }>()
 defineEmits<{ drill: [item: RunItem] }>()
 
 function boxStyle(item: RunItem, index: number) {
+  if (item.status === 'cancelled') {
+    return {
+      borderColor: 'var(--alert)',
+      borderStyle: 'dashed',
+      background: 'transparent',
+      animationDelay: `${Math.min(index * 90, 900)}ms`,
+    }
+  }
   const finished = item.passed
   return {
     borderColor: item.error_code ? 'var(--alert-deep)' : finished ? 'var(--assay)' : 'var(--rule-line)',

@@ -5,6 +5,11 @@ is persisted as an Issue with its ``row_index`` (0-based data row, header
 excluded) and the original cell text. At most ``sample_limit`` issues per rule
 are stored, but ``violation_count`` / ``rules_passed`` / ``rules_failed`` always
 reflect the true numbers, and isolated rows are written to the quarantine volume.
+
+Cancellation is cooperative: the loop checks the run row before and after every
+rule, commits each finished rule immediately (the partial results stay as
+diagnostics), and the terminal write is a guarded UPDATE — once a batch is
+cancelled, a late finish signal can never flip its status or results back.
 """
 import time
 from datetime import datetime
@@ -14,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.constants.error_codes import AppError
 from app.constants.issue_status import IssueStatus
-from app.constants.rule_run_status import RuleRunStatus
+from app.constants.rule_run_status import ACTIVE_STATUSES, RuleRunStatus
 from app.constants.rule_type import RuleType
 from app.constants.severity import Severity
 from app.models import Dataset, Issue, QualityRule, RuleRun, RuleRunItem
@@ -49,9 +54,22 @@ def load_target_values(db: Session, params: dict) -> set[str]:
     return {str(value) for value in series if str(value).strip() != ""}
 
 
-def _next_report_no(db: Session) -> str:
-    used = db.query(RuleRun).filter(RuleRun.report_no.isnot(None)).count()
-    return f"QC-202611-{used + 1:03d}"
+def _report_no_for(run_id: int) -> str:
+    """Report numbers derive from the run id: unique even when two batches
+    finish concurrently, and stable across re-exports."""
+    return f"QC-202611-{run_id:03d}"
+
+
+def _cancelled_summary(run_id: int, total: int, passed: int = 0, failed: int = 0, rows: int = 0, started: float | None = None) -> dict:
+    log_event("RUN_CANCEL_OBSERVED", run_id=run_id, finished_rules=passed + failed, total=total)
+    return {
+        "cancelled": True,
+        "violations_by_rule": {},
+        "rules_passed": passed,
+        "rules_failed": failed,
+        "rows_scanned": rows,
+        "duration_ms": int((time.perf_counter() - started) * 1000) if started else 0,
+    }
 
 
 def execute_batch(
@@ -63,15 +81,38 @@ def execute_batch(
 ) -> dict:
     started_wall = datetime.now()
     started = time.perf_counter()
-    run.status = RuleRunStatus.RUNNING.value
-    run.started_at = started_wall
-    run.rules_total = len(rules)
+
+    # claim the batch (queued/failed -> running); if a cancel landed first, stop here
+    claimed = (
+        db.query(RuleRun)
+        .filter(
+            RuleRun.id == run.id,
+            RuleRun.status.in_([RuleRunStatus.QUEUED.value, RuleRunStatus.FAILED.value]),
+        )
+        .update(
+            {
+                RuleRun.status: RuleRunStatus.RUNNING.value,
+                RuleRun.started_at: started_wall,
+                RuleRun.rules_total: len(rules),
+            },
+            synchronize_session=False,
+        )
+    )
     db.commit()
+    if not claimed:
+        return _cancelled_summary(run.id, len(rules), started=started)
+    db.refresh(run)
 
     loaded = load_frame(dataset.file_path, dataset.source_format)
     df = loaded.df
-    run.rows_scanned = loaded.row_count
+    # the scan size is recorded only while the batch is still live
+    db.query(RuleRun).filter(
+        RuleRun.id == run.id, RuleRun.status == RuleRunStatus.RUNNING.value
+    ).update({RuleRun.rows_scanned: loaded.row_count}, synchronize_session=False)
     db.commit()
+    db.refresh(run)
+    if run.status == RuleRunStatus.CANCELLED.value:
+        return _cancelled_summary(run.id, len(rules), rows=loaded.row_count, started=started)
 
     log_event(
         "RUN_STARTED",
@@ -83,10 +124,15 @@ def execute_batch(
 
     passed = 0
     failed = 0
+    cancelled_observed = False
     violations_by_rule: dict[int, set[int]] = {}
     quarantine_indexes: set[int] = set()
 
     for rule in rules:
+        db.refresh(run)
+        if run.status == RuleRunStatus.CANCELLED.value:
+            cancelled_observed = True
+            break
         rule_started = time.perf_counter()
         item = RuleRunItem(
             run_id=run.id,
@@ -134,6 +180,20 @@ def execute_batch(
                 item.error_code = error_code
                 log_event("RUN_FAILED", run_id=run.id, error_code=error_code, reason=str(exc))
 
+        # the cancel may have landed while this rule was scanning. Claim the row
+        # with a write-lock probe (self-assigning UPDATE): it serialises against
+        # the cancel path's guarded UPDATE, so a lost probe means the batch now
+        # belongs to the cancel path and this rule's writes are dropped — the
+        # ledger never ends up with both a result and a cancelled placeholder.
+        still_live = (
+            db.query(RuleRun)
+            .filter(RuleRun.id == run.id, RuleRun.status == RuleRunStatus.RUNNING.value)
+            .update({RuleRun.status: RuleRunStatus.RUNNING.value}, synchronize_session=False)
+        )
+        if not still_live:
+            cancelled_observed = True
+            break
+
         persisted = 0
         if error_code is None:
             for row_index, observed, expected in result.samples:
@@ -169,7 +229,7 @@ def execute_batch(
             passed += 1
         else:
             failed += 1
-        db.flush()
+        db.commit()  # each finished rule lands immediately: diagnostics + live progress
         log_event(
             "RUN_RULE_FINISHED",
             run_id=run.id,
@@ -186,29 +246,48 @@ def execute_batch(
         rows = [[str(value) for value in df.loc[idx].tolist()] for idx in ordered if idx in df.index]
         storage.write_quarantine(run.id, header, rows)
 
-    run.rules_passed = passed
-    run.rules_failed = failed
-    run.duration_ms = int((time.perf_counter() - started) * 1000)
-    run.status = RuleRunStatus.SUCCEEDED.value
-    run.finished_at = datetime.now()
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    if cancelled_observed:
+        return _cancelled_summary(run.id, len(rules), passed, failed, loaded.row_count, started)
+
+    # guarded terminal write: a cancel that raced the last rule wins, and this
+    # late finish signal is dropped instead of flipping the batch back
+    final_values = {
+        RuleRun.rules_passed: passed,
+        RuleRun.rules_failed: failed,
+        RuleRun.rules_unfinished: 0,
+        RuleRun.duration_ms: duration_ms,
+        RuleRun.status: RuleRunStatus.SUCCEEDED.value,
+        RuleRun.finished_at: datetime.now(),
+    }
     if run.kind == "rules" and not run.report_no:
-        run.report_no = _next_report_no(db)
+        final_values[RuleRun.report_no] = _report_no_for(run.id)
+    finished = (
+        db.query(RuleRun)
+        .filter(RuleRun.id == run.id, RuleRun.status.in_(sorted(ACTIVE_STATUSES)))
+        .update(final_values, synchronize_session=False)
+    )
     db.commit()
+    if not finished:
+        db.refresh(run)
+        log_event("RUN_STALE_FINISH", run_id=run.id, status=run.status)
+        return _cancelled_summary(run.id, len(rules), passed, failed, loaded.row_count, started)
 
     log_event(
         "RUN_FINISHED",
         run_id=run.id,
-        status=run.status,
+        status=RuleRunStatus.SUCCEEDED.value,
         rules_passed=passed,
         rules_failed=failed,
-        duration_ms=run.duration_ms,
+        duration_ms=duration_ms,
     )
     return {
+        "cancelled": False,
         "violations_by_rule": violations_by_rule,
         "rules_passed": passed,
         "rules_failed": failed,
         "rows_scanned": loaded.row_count,
-        "duration_ms": run.duration_ms,
+        "duration_ms": duration_ms,
     }
 
 

@@ -2,10 +2,12 @@
 
 * daily quota: users.daily_scan_quota / quota_used / quota_used_date
 * sliding window: zset ``rl:qualiscope:{user_id}`` (RATE_WINDOW_SECONDS)
-* dataset lock: SETNX ``runlock:{dataset_id}`` so one dataset never runs twice
-  in parallel (rule_runs.status participates in the UI's RunLockState)
+* dataset lock: ``SET runlock:{dataset_id} {token} NX EX`` so one dataset never
+  runs twice in parallel. The token identifies the holding batch: a stale worker
+  finishing late can only release its own lock, never the next batch's.
 """
 import time
+import uuid
 from datetime import date
 
 import redis
@@ -19,8 +21,16 @@ from app.utils.logger import log_event
 
 _client = None
 _mem_window: dict[str, list[float]] = {}
-_mem_locks: dict[int, float] = {}
+_mem_locks: dict[int, tuple[str, float]] = {}
 LOCK_TTL_SECONDS = 1800
+
+# compare-and-delete so a late finish signal only releases its own batch's lock
+_RELEASE_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
 
 
 def get_redis():
@@ -67,28 +77,43 @@ def _mem_allow(key: str, now: float, window: int, max_hits: int) -> bool:
     return len(hits) <= max_hits
 
 
-def acquire_dataset_lock(dataset_id: int) -> bool:
+def new_lock_token() -> str:
+    return uuid.uuid4().hex
+
+
+def acquire_dataset_lock(dataset_id: int, token: str) -> bool:
     client = get_redis()
     if client is not None:
         try:
-            return bool(client.set(f"runlock:{dataset_id}", "1", nx=True, ex=LOCK_TTL_SECONDS))
+            return bool(client.set(f"runlock:{dataset_id}", token, nx=True, ex=LOCK_TTL_SECONDS))
         except Exception:
             pass
-    expiry = _mem_locks.get(dataset_id)
-    if expiry and expiry > time.time():
+    held = _mem_locks.get(dataset_id)
+    if held and held[1] > time.time():
         return False
-    _mem_locks[dataset_id] = time.time() + LOCK_TTL_SECONDS
+    _mem_locks[dataset_id] = (token, time.time() + LOCK_TTL_SECONDS)
     return True
 
 
-def release_dataset_lock(dataset_id: int) -> None:
+def release_dataset_lock(dataset_id: int, token: str | None = None) -> None:
+    """Release the per-dataset lock.
+
+    With ``token`` the lock is only removed when the token still matches the
+    holder — a stale worker's late ``finally`` must not unlock the batch that
+    started after it. ``token=None`` force-releases (legacy rows without one).
+    """
     client = get_redis()
     if client is not None:
         try:
-            client.delete(f"runlock:{dataset_id}")
+            if token is None:
+                client.delete(f"runlock:{dataset_id}")
+            else:
+                client.eval(_RELEASE_LOCK_LUA, 1, f"runlock:{dataset_id}", token)
         except Exception:
             pass
-    _mem_locks.pop(dataset_id, None)
+    held = _mem_locks.get(dataset_id)
+    if held and (token is None or held[0] == token):
+        _mem_locks.pop(dataset_id, None)
 
 
 def quota_snapshot(user: User) -> dict:
@@ -104,7 +129,12 @@ def quota_snapshot(user: User) -> dict:
     }
 
 
-def consume_scan(db: Session, user: User, dataset_id: int, action: str) -> dict:
+def consume_scan(db: Session, user: User, dataset_id: int, action: str) -> str:
+    """Charge quota and take the dataset lock; returns the lock token.
+
+    The caller persists the token on the run row so both the API (cancel path)
+    and the worker (late ``finally``) release only the lock this batch holds.
+    """
     today = date.today()
     if user.quota_used_date != today:
         user.quota_used_date = today
@@ -129,12 +159,13 @@ def consume_scan(db: Session, user: User, dataset_id: int, action: str) -> dict:
                 "retry_after": 3600,
             },
         )
-    if not acquire_dataset_lock(dataset_id):
+    token = new_lock_token()
+    if not acquire_dataset_lock(dataset_id, token):
         log_event("PROFILE_RUN_LOCKED", dataset_id=dataset_id, user_id=user.id)
         raise AppError(ErrorCode.RUN_LOCKED, detail={"dataset_id": dataset_id, "action": action})
     user.quota_used += 1
     db.commit()
-    return quota_snapshot(user)
+    return token
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):

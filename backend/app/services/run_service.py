@@ -1,10 +1,12 @@
 import time
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
 from app.config.celery_app import celery_app
 from app.constants.error_codes import AppError, ErrorCode
-from app.constants.rule_run_status import RuleRunStatus
+from app.constants.issue_status import IssueStatus
+from app.constants.rule_run_status import ACTIVE_STATUSES, RuleRunItemStatus, RuleRunStatus
 from app.models import ColumnProfile, Dataset, Issue, QualityRule, RuleRun, RuleRunItem, User
 from app.middlewares import quota
 from app.schemas.profile import serialize_column_profile
@@ -51,13 +53,15 @@ def bulk_run(db: Session, actor: User, dataset_id: int, rule_ids: list[int] | No
             message="没有可执行的启用规则",
             detail={"dataset_id": dataset_id},
         )
-    quota.consume_scan(db, actor, dataset_id, "run")
+    quota_token = quota.consume_scan(db, actor, dataset_id, "run")
     run = RuleRun(
         dataset_id=dataset_id,
         kind="rules",
         triggered_by=actor.id,
         status=RuleRunStatus.QUEUED.value,
         rules_total=len(rules),
+        rule_ids=[rule.id for rule in rules],
+        lock_token=quota_token,
     )
     db.add(run)
     db.commit()
@@ -92,15 +96,98 @@ def run_detail(db: Session, run: RuleRun) -> dict:
 
 
 def cancel_run(db: Session, run: RuleRun, actor: User) -> RuleRun:
-    if run.status not in (RuleRunStatus.QUEUED.value, RuleRunStatus.RUNNING.value):
+    """Abort a queued/running batch.
+
+    Once this returns, the batch is frozen: its status and business results
+    never change again. Issues it already produced are shelved to ``ignored``
+    (kept for diagnostics, out of the pending ledger), and rules that never
+    ran get a ``cancelled`` placeholder item so the ledger shows the gap.
+    """
+    # guard update: only a live batch may be cancelled, exactly once
+    claimed = (
+        db.query(RuleRun)
+        .filter(RuleRun.id == run.id, RuleRun.status.in_(sorted(ACTIVE_STATUSES)))
+        .update(
+            {
+                RuleRun.status: RuleRunStatus.CANCELLED.value,
+                RuleRun.error_code: "QUAL-5010",
+                RuleRun.finished_at: datetime.now(),
+            },
+            synchronize_session=False,
+        )
+    )
+    if not claimed:
         raise AppError(ErrorCode.RUN_LOCKED, message="批次已结束，无法取消", detail={"run_id": run.id})
-    run.status = RuleRunStatus.FAILED.value
-    run.error_code = "QUAL-5010"
-    run.finished_at = run.finished_at or run.started_at
+    db.commit()  # status lands first: the worker sees it on its next check
+
+    # shelve the partial results: pending issues leave the ledger but stay
+    # queryable for diagnostics (ignored is reopenable, so nothing is lost)
+    shelved = 0
+    pending_issues = (
+        db.query(Issue)
+        .filter(
+            Issue.rule_run_id == run.id,
+            Issue.status.in_([IssueStatus.OPEN.value, IssueStatus.TRIAGED.value]),
+        )
+        .all()
+    )
+    for issue in pending_issues:
+        issue.status = IssueStatus.IGNORED.value
+        issue.note = (issue.note or "") + f"[run#{run.id} 批次已中止，仅作诊断留存]"
+        shelved += 1
+
+    # mark the rules that never finished so the ledger can name them
+    unfinished = 0
+    snapshot_ids = list(run.rule_ids or [])
+    if run.kind == "rules" and snapshot_ids:
+        done_rule_ids = {
+            row[0]
+            for row in db.query(RuleRunItem.rule_id)
+            .filter(RuleRunItem.run_id == run.id, RuleRunItem.rule_id.isnot(None))
+            .all()
+        }
+        missing_ids = [rule_id for rule_id in snapshot_ids if rule_id not in done_rule_ids]
+        skipped_rules = (
+            db.query(QualityRule).filter(QualityRule.id.in_(missing_ids)).all() if missing_ids else []
+        )
+        for rule in skipped_rules:
+            db.add(
+                RuleRunItem(
+                    run_id=run.id,
+                    rule_id=rule.id,
+                    rule_name=rule.name,
+                    rule_type=rule.rule_type,
+                    column_name=rule.column_name,
+                    severity=rule.severity,
+                    status=RuleRunItemStatus.CANCELLED.value,
+                    passed=False,
+                )
+            )
+            unfinished += 1
+    elif run.kind == "rules":
+        finished_items = db.query(RuleRunItem).filter(RuleRunItem.run_id == run.id).count()
+        unfinished = max(0, (run.rules_total or 0) - finished_items)
+    # freeze the partial tallies too: passed/failed reflect the rules that did
+    # finish, ``rules_unfinished`` names the gap left by the abort
+    finished_rows = (
+        db.query(RuleRunItem)
+        .filter(RuleRunItem.run_id == run.id, RuleRunItem.status == RuleRunItemStatus.FINISHED.value)
+        .all()
+    )
+    db.query(RuleRun).filter(RuleRun.id == run.id).update(
+        {
+            RuleRun.rules_unfinished: unfinished,
+            RuleRun.rules_passed: sum(1 for item in finished_rows if item.passed),
+            RuleRun.rules_failed: sum(1 for item in finished_rows if not item.passed),
+        },
+        synchronize_session=False,
+    )
     db.commit()
+
+    quota.release_dataset_lock(run.dataset_id, run.lock_token)
     db.refresh(run)
-    quota.release_dataset_lock(run.dataset_id)
     log_event("RUN_CANCELLED", run_id=run.id, actor_id=actor.id)
+    log_event("RUN_CANCEL_SHELVED", run_id=run.id, issues=shelved, unfinished=unfinished)
     return run
 
 

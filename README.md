@@ -46,7 +46,7 @@ docker compose exec backend python -m scripts.seed_demo
 - **列级剖析**：`profiling/loader.py` 读 CSV/Parquet/JSONL/XLSX（重复列名 400、非 UTF-8 400、超行数 400）；`type_infer.py` 抽样 1 万行按命中率 ≥0.95 判类型；`stats.py` 全量算空值率/基数/分位/Top 值；`pattern.py` 字符类归并推断正则与命中率；`outliers.py` IQR 1.5 倍异常值。
 - **规则构建与批量执行**：7 种 `RuleType` 各自独立校验器，pandas 向量化定位 + 逐条保留 `row_index` 与原文 `observed_value`，每规则最多落 `sample_limit` 条 Issue 但统计值记真实数量；违规行同时写入隔离卷 `run_XXXXXX_quarantine.csv`。
 - **问题分诊与指派**：状态机 `open → triaged → fixed/ignored`，支持按严重度/状态/规则筛选、批量指派、复制复现片段。
-- **审计与配额**：写操作在响应阶段写入 `audit_logs`（before/after 快照）；`users.daily_scan_quota` + Redis 滑动窗口 + `SETNX runlock:{dataset_id}` 保证同一数据集不并行执行，超限 429 并带 `retry_after`。
+- **审计与配额**：写操作在响应阶段写入 `audit_logs`（before/after 快照）；`users.daily_scan_quota` + Redis 滑动窗口 + `SET runlock:{dataset_id} {token} NX EX` 保证同一数据集不并行执行，超限 429 并带 `retry_after`；批次中止后锁按 token 定向释放，旧批次晚到的结束信号解不开新批次的锁。
 
 ## 技术栈
 
@@ -146,10 +146,12 @@ cd backend && celery -A app.config.celery_app worker -l info
 - 前端：`constants/issueStatus.ts`（定义 + 标签）、`types/issue.ts`、`components/issue/IssueStatusMenu.vue`（状态按钮组）、`components/issue/IssueDrawer.vue`、`components/issue/IssueFilterBar.vue`、`stores/issueStore.ts`、`pages/IssuesPage.vue`（列分组）
 - 后端：`app/constants/issue_status.py`（定义 + 状态机 TRANSITIONS）、`services/issue_service.py`（流转校验）、`rules/engine.py`（新建 open）、`rules/engine.py#recheck_open_issues`（收敛转 fixed）、`models/issue.py`、`scripts/seed_demo.py`（triaged 预置）
 
-### RuleRunStatus（queued/running/succeeded/failed）
+### RuleRunStatus（queued/running/succeeded/failed/cancelled）
 
-- 前端：`constants/ruleRunStatus.ts`（定义 + 标签 + 终态）、`components/run/RunStatusTag.vue`、`components/run/RunProgressList.vue`、`hooks/useRunPolling.ts`（终态停表）、`types/run.ts`、`pages/RunsPage.vue`
-- 后端：`app/constants/rule_run_status.py`（定义 + TERMINAL_STATUSES + RunKind）、`tasks/execute_rules.py`（失败置 failed）、`tasks/profile_dataset.py`、`services/run_service.py`（queued / cancel）、`rules/engine.py`（running → succeeded）、`models/rule_run.py`、`constants/log_templates.py`
+- 前端：`constants/ruleRunStatus.ts`（枚举定义 + 中文标签 + 终态 + item 状态）、`components/run/RunStatusTag.vue`、`components/run/RunProgressList.vue`（未跑完占位）、`hooks/useRunPolling.ts`（终态停表）、`types/run.ts`、`pages/RunsPage.vue`（中止按钮 + 确认框）
+- 后端：`app/constants/rule_run_status.py`（定义 + TERMINAL_STATUSES + ACTIVE_STATUSES + RuleRunItemStatus + RunKind）、`tasks/execute_rules.py`（取消观测 / 守卫置 failed）、`tasks/profile_dataset.py`、`services/run_service.py`（queued / cancel_run 冻结批次）、`rules/engine.py`（协作式取消 + 守卫终态写入）、`models/rule_run.py`、`models/rule_run_item.py`、`constants/log_templates.py`
+
+中止语义：`POST /runs/{id}/cancel` 仅在 queued/running 时生效（条件更新，幂等于并发），批次即刻冻结为 `cancelled`；该批 open/triaged 问题单批量转 `ignored`（仅诊断留存，可再打开），未跑规则补 `cancelled` 占位 item；worker 每条规则前后检查取消信号，终态写入全部带状态守卫，晚到的完成信号直接丢弃；数据集锁按 `lock_token` 定向释放，旧批次无法解开新批次的锁。
 
 ## 七种规则类型（params 形态 + 最小示例）
 
