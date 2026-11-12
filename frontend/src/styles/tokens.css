@@ -1,0 +1,17 @@
+/* QualiScope design tokens — the only place concrete colours are written.
+   Mood: scientific specimen archive / lab report — warm paper, ink, assay blue,
+   safety orange. */
+:root {
+  --paper: oklch(97.2% 0.008 82);
+  --paper-2: oklch(94.5% 0.012 80);
+  --rule-line: oklch(86% 0.014 78);
+  --ink: oklch(23% 0.012 68);
+  --ink-soft: oklch(45% 0.01 68);
+  --assay: oklch(52% 0.1 250);
+  --alert: oklch(63% 0.17 55);
+  --alert-deep: oklch(46% 0.15 38);
+  --low: oklch(62% 0.03 240);
+  --rail: 280px;
+  --rail-collapsed: 64px;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}

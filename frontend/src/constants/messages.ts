@@ -1,0 +1,17 @@
+export const MESSAGES = {
+  appName: 'QualiScope',
+  appSubtitle: '数据可信度治理平台',
+  customer: '明川银行 · 数据治理组',
+  datasets: '标本索引',
+  profile: '检验报告单',
+  rules: '规则构建器',
+  runs: '执行台账',
+  issues: '问题分诊板',
+  login: '登录',
+  logout: '退出',
+  uploadHint: '先上传一份 CSV：首行为表头，单列不要重名，建议不超过 20 万行',
+  ruleEmptyHint: '规则由列决定：先选一列，再选 not_null 或 range 起步',
+  issueEmptyHint: '执行一次规则批次后，违规行会按严重度进这里',
+  auditRecorded: '已记入审计',
+  noQuota: '今日配额已用完',
+}
